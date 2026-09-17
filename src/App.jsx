@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import * as d3 from "d3";
-import { Search, RotateCcw, Check, MapPin, Globe2, AlertTriangle, Download, Upload, Sparkles } from "lucide-react";
+import { Search, RotateCcw, Check, MapPin, Globe2, AlertTriangle, Download, Upload, Sparkles, Star } from "lucide-react";
 
 /* =============================================================================
  * 旅の記録アトラス / Travel Atlas
@@ -294,16 +294,17 @@ function saveVisited(key, data) {
 
 /**
  * データの書き出し／読み込み。
- * 「訪問済みの県・国＋メモ」を1つのJSONファイルとしてダウンロードし、
+ * 「訪問済み・行く予定の県・国＋メモ」を1つのJSONファイルとしてダウンロードし、
  * 別のブラウザ・別の端末でも同じファイルを読み込めば記録を引き継げる。
  * localStorageは端末ごとに独立しているため、この仕組みが「引っ越し用のかばん」になる。
  */
-function buildBackupFile(visited) {
+function buildBackupFile(visited, planned) {
   const payload = {
     app: "travel-atlas",
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     visited,
+    planned,
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -319,9 +320,14 @@ function buildBackupFile(visited) {
 /** バックアップファイルの中身を検証しつつ取り出す。壊れたファイルなら例外を投げる。 */
 function parseBackupFile(text) {
   const parsed = JSON.parse(text);
-  const jp = parsed && parsed.visited && typeof parsed.visited.jp === "object" ? parsed.visited.jp : {};
-  const world = parsed && parsed.visited && typeof parsed.visited.world === "object" ? parsed.visited.world : {};
-  return { jp, world };
+  const pick = (obj, key) => (obj && typeof obj[key] === "object" ? obj[key] : {});
+  return {
+    jp: pick(parsed.visited, "jp"),
+    world: pick(parsed.visited, "world"),
+    // version 1のバックアップにはplannedが無いので、無ければ空のまま読み込む
+    plannedJp: pick(parsed.planned, "jp"),
+    plannedWorld: pick(parsed.planned, "world"),
+  };
 }
 
 /* ============================== VIEW ====================================== */
@@ -427,7 +433,7 @@ function ErrorPanel({ message }) {
   );
 }
 
-function MapView({ kind, features, fc, visited, highlight, onToggle, projected, viewBox }) {
+function MapView({ kind, features, fc, visited, planned, highlight, onToggle, projected, viewBox }) {
   const [width, height] = viewBox;
 
   // 投影(projection)はデータが変わったときだけ計算し直せば十分なのでメモ化する。
@@ -435,13 +441,16 @@ function MapView({ kind, features, fc, visited, highlight, onToggle, projected, 
   // 二重に投影しないよう projection を渡さない（= 恒等変換で座標をそのまま使う）。
   // 世界地図はNatural Earth図法を使用。南極や高緯度地方の間延びが
   // Equal Earth図法より穏やかで、全体の見た目もやわらかい。
-  const pathFor = useMemo(() => {
+  const { pathFor, centroidFor } = useMemo(() => {
     const projection = projected
       ? null
       : d3.geoNaturalEarth1().fitSize([width, height], fc);
     const gen = d3.geoPath(projection);
-    return (feature) =>
-      gen({ type: "Feature", geometry: { type: feature.type, coordinates: feature.coordinates } });
+    const toGeom = (feature) => ({ type: "Feature", geometry: { type: feature.type, coordinates: feature.coordinates } });
+    return {
+      pathFor: (feature) => gen(toGeom(feature)),
+      centroidFor: (feature) => gen.centroid(toGeom(feature)),
+    };
   }, [fc, projected, width, height]);
 
   return (
@@ -464,20 +473,42 @@ function MapView({ kind, features, fc, visited, highlight, onToggle, projected, 
           const d = pathFor(f);
           if (!d) return null;
           const entry = visited[f.id];
+          const isPlanned = !entry && Boolean(planned[f.id]);
           const isHighlighted =
             highlight && highlight.trim().length > 0 && f.name.includes(highlight.trim());
           return (
             <path
               key={f.id}
               d={d}
-              fill={entry ? entry.color : "#FFFBFE"}
-              stroke={isHighlighted ? "#FF6FA0" : "#C9B8E8"}
-              strokeWidth={isHighlighted ? 2.5 : 0.7}
+              fill={entry ? entry.color : isPlanned ? "#FFF6DD" : "#FFFBFE"}
+              stroke={isHighlighted ? "#FF6FA0" : isPlanned ? "#FFB020" : "#C9B8E8"}
+              strokeWidth={isHighlighted ? 2.5 : isPlanned ? 1.6 : 0.7}
+              strokeDasharray={isPlanned ? "4 2" : undefined}
               className="tm-region"
               onClick={() => onToggle(f)}
             >
-              <title>{f.name}</title>
+              <title>{f.name}{isPlanned ? "（行く予定）" : ""}</title>
             </path>
+          );
+        })}
+        {/* 「行く予定」の場所には、図形の重心に⭐マークを立てる */}
+        {features.map((f) => {
+          const entry = visited[f.id];
+          if (entry || !planned[f.id]) return null;
+          const [cx, cy] = centroidFor(f);
+          if (!Number.isFinite(cx) || !Number.isFinite(cy)) return null;
+          return (
+            <text
+              key={`star-${f.id}`}
+              x={cx}
+              y={cy}
+              textAnchor="middle"
+              dominantBaseline="middle"
+              fontSize={kind === "jp" ? 13 : 11}
+              style={{ pointerEvents: "none" }}
+            >
+              ⭐
+            </text>
           );
         })}
       </svg>
@@ -500,7 +531,36 @@ function SearchBox({ value, onChange, placeholder }) {
   );
 }
 
-function RegionList({ features, visited, search, onToggle, onNoteChange, headerLabel }) {
+/** 「すべて／行った／まだ」の切り替えフィルター。 */
+function FilterTabs({ value, onChange, visitedCount, plannedCount, unvisitedCount }) {
+  const options = [
+    { key: "all", label: "すべて", emoji: "🗺️" },
+    { key: "visited", label: "行った", emoji: "✅", count: visitedCount },
+    { key: "planned", label: "予定", emoji: "⭐", count: plannedCount },
+    { key: "unvisited", label: "まだ", emoji: "🤍", count: unvisitedCount },
+  ];
+  return (
+    <div style={styles.filterTabs}>
+      {options.map((opt) => {
+        const active = value === opt.key;
+        return (
+          <button
+            key={opt.key}
+            className="tm-pill-btn"
+            onClick={() => onChange(opt.key)}
+            style={{ ...styles.filterTabButton, ...(active ? styles.filterTabButtonActive : {}) }}
+          >
+            <span style={{ marginRight: 5 }}>{opt.emoji}</span>
+            {opt.label}
+            {opt.count != null && <span style={styles.filterTabCount}>{opt.count}</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function RegionList({ features, visited, planned, search, filterMode, onToggle, onTogglePlanned, onNoteChange, onPlannedNoteChange, headerLabel }) {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const sorted = [...features].sort((a, b) =>
@@ -508,11 +568,17 @@ function RegionList({ features, visited, search, onToggle, onNoteChange, headerL
         ? a.sortOrder - b.sortOrder
         : a.name.localeCompare(b.name, "ja")
     );
-    if (!q) return sorted;
-    return sorted.filter(
+    const byFilter = sorted.filter((f) => {
+      if (filterMode === "visited") return Boolean(visited[f.id]);
+      if (filterMode === "planned") return !visited[f.id] && Boolean(planned[f.id]);
+      if (filterMode === "unvisited") return !visited[f.id];
+      return true;
+    });
+    if (!q) return byFilter;
+    return byFilter.filter(
       (f) => f.name.toLowerCase().includes(q) || (f.subName || "").toLowerCase().includes(q)
     );
-  }, [features, search]);
+  }, [features, search, filterMode, visited, planned]);
 
   const visitedCount = Object.keys(visited).length;
 
@@ -528,6 +594,8 @@ function RegionList({ features, visited, search, onToggle, onNoteChange, headerL
         {filtered.map((f) => {
           const entry = visited[f.id];
           const checked = Boolean(entry);
+          const plannedEntry = planned[f.id];
+          const isPlanned = !checked && Boolean(plannedEntry);
           return (
             <li key={f.id} className="tm-listitem" style={styles.listItem}>
               <span
@@ -541,10 +609,25 @@ function RegionList({ features, visited, search, onToggle, onNoteChange, headerL
               >
                 {checked && <Check size={12} color="#fff" strokeWidth={3} />}
               </span>
+              <button
+                type="button"
+                className="tm-star-btn"
+                onClick={() => onTogglePlanned(f)}
+                disabled={checked}
+                title={checked ? "訪問済みです" : isPlanned ? "行く予定を解除" : "行く予定にする"}
+                style={{
+                  ...styles.starButton,
+                  opacity: checked ? 0.25 : 1,
+                  color: isPlanned ? "#FFB020" : "#D9C6E8",
+                }}
+              >
+                <Star size={16} fill={isPlanned ? "#FFB020" : "none"} strokeWidth={2} />
+              </button>
               <span onClick={() => onToggle(f)} style={{ ...styles.listItemName, cursor: "pointer" }}>
                 {f.name}
               </span>
               {f.subName ? <span style={styles.listItemSub}>{f.subName}</span> : null}
+              {isPlanned && <span style={styles.plannedBadge}>行く予定</span>}
               {checked ? (
                 <input
                   type="text"
@@ -554,8 +637,17 @@ function RegionList({ features, visited, search, onToggle, onNoteChange, headerL
                   onClick={(e) => e.stopPropagation()}
                   onBlur={(e) => onNoteChange(f, e.target.value)}
                 />
+              ) : isPlanned ? (
+                <input
+                  type="text"
+                  defaultValue={plannedEntry.note || ""}
+                  placeholder="メモ（例: 桜の季節に行きたい）"
+                  style={{ ...styles.noteInput, background: "#FFF6DD", color: "#8A6A16" }}
+                  onClick={(e) => e.stopPropagation()}
+                  onBlur={(e) => onPlannedNoteChange(f, e.target.value)}
+                />
               ) : (
-                <span style={styles.noteHint}>訪問済みにするとメモを書けます</span>
+                <span style={styles.noteHint}>☆ をつけるとメモを書けます</span>
               )}
             </li>
           );
@@ -590,6 +682,9 @@ function GlobalStyle() {
       .tm-listitem:hover { background: #FFF0F7; }
       .tm-swatch { cursor: pointer; transition: transform 0.15s ease; }
       .tm-swatch:hover { transform: scale(1.15) rotate(-6deg); }
+      .tm-star-btn:not(:disabled) { transition: transform 0.15s ease; }
+      .tm-star-btn:not(:disabled):hover { transform: scale(1.2) rotate(10deg); }
+      .tm-star-btn:disabled { cursor: not-allowed; }
       .tm-tab { transition: transform 0.15s ease, box-shadow 0.15s ease; }
       .tm-tab:hover { transform: translateY(-2px); }
       .tm-pill-btn { transition: transform 0.15s ease, box-shadow 0.15s ease; }
@@ -677,6 +772,19 @@ const styles = {
   },
   svg: { width: "100%", height: "auto", display: "block", borderRadius: 16 },
   toolRow: { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" },
+  filterTabs: { display: "flex", gap: 8, flexWrap: "wrap" },
+  filterTabButton: {
+    display: "flex", alignItems: "center", padding: "8px 14px", borderRadius: 999,
+    border: "2px solid #FFD6E8", background: "#fff", color: "#B189D6",
+    fontSize: 12.5, fontWeight: 800, cursor: "pointer",
+  },
+  filterTabButtonActive: {
+    background: "linear-gradient(135deg, #FF8FB7, #B18CFF)", color: "#fff", borderColor: "transparent",
+  },
+  filterTabCount: {
+    marginLeft: 6, fontSize: 11, padding: "0 7px", borderRadius: 999,
+    background: "rgba(255,255,255,0.4)",
+  },
   searchBox: {
     flex: 1, minWidth: 220, display: "flex", alignItems: "center", gap: 8,
     background: "#fff", border: "2px solid #FFD6E8", borderRadius: 999, padding: "10px 16px",
@@ -701,6 +809,14 @@ const styles = {
   swatch: {
     width: 22, height: 22, borderRadius: "50%", border: "2px solid #E7D6EE",
     display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+  },
+  starButton: {
+    display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+    width: 26, height: 26, borderRadius: "50%", border: "none", background: "transparent", cursor: "pointer",
+  },
+  plannedBadge: {
+    fontSize: 11, fontWeight: 800, color: "#B8760A", background: "#FFF3D6",
+    padding: "2px 8px", borderRadius: 999,
   },
   listItemName: { flex: "0 0 auto", fontWeight: 700 },
   listItemSub: { fontSize: 12, color: "#B189D6" },
@@ -727,7 +843,9 @@ const styles = {
 export default function App() {
   const [tab, setTab] = useState("jp");
   const [search, setSearch] = useState({ jp: "", world: "" });
+  const [filterMode, setFilterMode] = useState({ jp: "all", world: "all" });
   const [visited, setVisited] = useState({ jp: {}, world: {} });
+  const [planned, setPlanned] = useState({ jp: {}, world: {} });
   const [mapState, setMapState] = useState({
     jp: { status: "idle" },
     world: { status: "idle" },
@@ -736,11 +854,15 @@ export default function App() {
   // (座標の配列は巨大で、再レンダリングのたびに比較する必要がないため)
   const dataCache = useRef({});
 
-  // 保存済みの訪問記録を最初に一度だけ読み込む
+  // 保存済みの訪問記録・行く予定リストを最初に一度だけ読み込む
   useEffect(() => {
     setVisited({
       jp: loadVisited("visited-jp-v1"),
       world: loadVisited("visited-world-v1"),
+    });
+    setPlanned({
+      jp: loadVisited("planned-jp-v1"),
+      world: loadVisited("planned-world-v1"),
     });
   }, []);
 
@@ -798,6 +920,7 @@ export default function App() {
   const toggleVisited = useCallback((tabKey, feature) => {
     setVisited((prev) => {
       const current = { ...prev[tabKey] };
+      const becomingVisited = !current[feature.id];
       if (current[feature.id]) {
         delete current[feature.id];
       } else {
@@ -807,6 +930,32 @@ export default function App() {
         current[feature.id] = { color: pickColor(neighborIdx, colorByIndex), note: "" };
       }
       saveVisited(tabKey === "jp" ? "visited-jp-v1" : "visited-world-v1", current);
+
+      // 訪問済みになった場所は「行く予定」から自動的に外す（もう予定ではなく実績なので）
+      if (becomingVisited) {
+        setPlanned((prevPlanned) => {
+          if (!prevPlanned[tabKey][feature.id]) return prevPlanned;
+          const nextPlanned = { ...prevPlanned[tabKey] };
+          delete nextPlanned[feature.id];
+          saveVisited(tabKey === "jp" ? "planned-jp-v1" : "planned-world-v1", nextPlanned);
+          return { ...prevPlanned, [tabKey]: nextPlanned };
+        });
+      }
+
+      return { ...prev, [tabKey]: current };
+    });
+  }, []);
+
+  // 「行く予定」のON/OFF切り替え。訪問済みの場所には使わない。
+  const togglePlanned = useCallback((tabKey, feature) => {
+    setPlanned((prev) => {
+      const current = { ...prev[tabKey] };
+      if (current[feature.id]) {
+        delete current[feature.id];
+      } else {
+        current[feature.id] = { note: "" };
+      }
+      saveVisited(tabKey === "jp" ? "planned-jp-v1" : "planned-world-v1", current);
       return { ...prev, [tabKey]: current };
     });
   }, []);
@@ -824,9 +973,26 @@ export default function App() {
     });
   }, []);
 
+  // 「行く予定」側のメモだけを更新する
+  const updatePlannedNote = useCallback((tabKey, feature, note) => {
+    setPlanned((prev) => {
+      if (!prev[tabKey][feature.id]) return prev; // 予定になければ何もしない
+      const current = {
+        ...prev[tabKey],
+        [feature.id]: { ...prev[tabKey][feature.id], note },
+      };
+      saveVisited(tabKey === "jp" ? "planned-jp-v1" : "planned-world-v1", current);
+      return { ...prev, [tabKey]: current };
+    });
+  }, []);
+
   const resetTab = useCallback((tabKey) => {
     setVisited((prev) => {
       saveVisited(tabKey === "jp" ? "visited-jp-v1" : "visited-world-v1", {});
+      return { ...prev, [tabKey]: {} };
+    });
+    setPlanned((prev) => {
+      saveVisited(tabKey === "jp" ? "planned-jp-v1" : "planned-world-v1", {});
       return { ...prev, [tabKey]: {} };
     });
   }, []);
@@ -841,9 +1007,9 @@ export default function App() {
 
   // 日本＋世界のデータをまとめて1つのJSONファイルとして書き出す
   const handleExport = useCallback(() => {
-    buildBackupFile(visited);
+    buildBackupFile(visited, planned);
     showToast("バックアップを書き出したよ 🎁");
-  }, [visited, showToast]);
+  }, [visited, planned, showToast]);
 
   // 書き出したJSONファイルを読み込んで、記録を丸ごと上書きする
   const handleImportFile = useCallback(
@@ -851,10 +1017,13 @@ export default function App() {
       const reader = new FileReader();
       reader.onload = (e) => {
         try {
-          const { jp, world } = parseBackupFile(String(e.target.result));
+          const { jp, world, plannedJp, plannedWorld } = parseBackupFile(String(e.target.result));
           setVisited({ jp, world });
+          setPlanned({ jp: plannedJp, world: plannedWorld });
           saveVisited("visited-jp-v1", jp);
           saveVisited("visited-world-v1", world);
+          saveVisited("planned-jp-v1", plannedJp);
+          saveVisited("planned-world-v1", plannedWorld);
           showToast("きろくを読み込んだよ 🌈");
         } catch {
           showToast("読み込めなかったよ…ファイルを確認してね 🙏");
@@ -868,6 +1037,7 @@ export default function App() {
   const currentData = dataCache.current[tab];
   const currentStatus = mapState[tab].status;
   const currentVisited = visited[tab];
+  const currentPlanned = planned[tab];
 
   return (
     <div style={styles.page}>
@@ -895,6 +1065,7 @@ export default function App() {
               projected={currentData.projected}
               viewBox={currentData.viewBox}
               visited={currentVisited}
+              planned={currentPlanned}
               highlight={search[tab]}
               onToggle={(f) => toggleVisited(tab, f)}
             />
@@ -911,12 +1082,24 @@ export default function App() {
               </button>
             </div>
 
+            <FilterTabs
+              value={filterMode[tab]}
+              onChange={(mode) => setFilterMode((s) => ({ ...s, [tab]: mode }))}
+              visitedCount={Object.keys(currentVisited).length}
+              plannedCount={Object.keys(currentPlanned).length}
+              unvisitedCount={currentData.features.length - Object.keys(currentVisited).length}
+            />
+
             <RegionList
               features={currentData.features}
               visited={currentVisited}
+              planned={currentPlanned}
               search={search[tab]}
+              filterMode={filterMode[tab]}
               onToggle={(f) => toggleVisited(tab, f)}
+              onTogglePlanned={(f) => togglePlanned(tab, f)}
               onNoteChange={(f, note) => updateNote(tab, f, note)}
+              onPlannedNoteChange={(f, note) => updatePlannedNote(tab, f, note)}
               headerLabel={tab === "jp" ? "県名" : "国名"}
             />
           </>
